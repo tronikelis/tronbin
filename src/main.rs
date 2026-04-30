@@ -1,7 +1,14 @@
-use std::{env, net::Shutdown, path::Path, sync::Arc};
+use std::{
+    env,
+    net::Shutdown,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use smol::{
-    fs::{File, create_dir, create_dir_all},
+    Timer,
+    fs::{File, create_dir, create_dir_all, remove_file},
     io,
     lock::Mutex,
     net::{TcpListener, TcpStream},
@@ -79,9 +86,28 @@ fn base64_string(buf: &[u8]) -> String {
 }
 
 #[derive(Debug, Clone)]
+struct CreatedFile {
+    created_at: Instant,
+    path: PathBuf,
+}
+
+impl CreatedFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            created_at: Instant::now(),
+            path,
+        }
+    }
+
+    fn expired(&self, ttl: Duration) -> bool {
+        self.created_at.elapsed() > ttl
+    }
+}
+
+#[derive(Debug, Clone)]
 struct DataDb {
     dir: String,
-    files: Arc<Mutex<Vec<String>>>,
+    files: Arc<Mutex<Vec<CreatedFile>>>,
 }
 
 impl DataDb {
@@ -93,17 +119,44 @@ impl DataDb {
     }
 
     async fn insert(&self, id: String, reader: impl AsyncRead) -> anyhow::Result<()> {
-        self.files.lock().await.push(id.clone());
-
         let path = Path::new(&self.dir).join(&id);
 
         println!("creating file: {}", path.to_str().unwrap());
         let file = File::create(path.to_str().unwrap()).await?;
+        self.files.lock().await.push(CreatedFile::new(path.clone()));
 
         io::copy(reader, file).await?;
         println!("copied {} into {}", &id, path.to_str().unwrap());
 
         Ok(())
+    }
+
+    async fn gc(&self) -> anyhow::Result<()> {
+        let mut timer = Timer::interval(Duration::from_secs(1));
+        while let Some(_) = timer.next().await {
+            let mut files = self.files.lock().await;
+            let mut futures = Vec::new();
+            let mut i = 0;
+            while i < files.len() {
+                let file = files[i].clone();
+
+                if !file.expired(Duration::from_hours(6)) {
+                    i += 1;
+                    continue;
+                }
+
+                futures.push(async move {
+                    println!("removing: {}", file.path.to_str().unwrap());
+                    remove_file(&file.path).await?;
+                    anyhow::Ok(())
+                });
+                files.swap_remove(i);
+            }
+            for v in futures::future::join_all(futures).await {
+                v?;
+            }
+        }
+        unreachable!();
     }
 }
 
@@ -143,23 +196,30 @@ async fn async_main() -> anyhow::Result<()> {
     }
     let data_db = DataDb::new("/tmp/tronbin".to_string());
 
-    loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                println!("error accepting: {}", e);
-                continue;
-            }
-        };
-        println!("accepted: {}", addr);
-        smol::spawn(clone_expr!(data_db => async move {
-            match handle_stream(data_db, stream).await {
-                Ok(_) => {},
-                Err(e) => println!("handle_stream err: {}", e),
+    let gc_future = data_db.gc();
+
+    let main_future = async {
+        loop {
+            let (stream, addr) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("error accepting: {}", e);
+                    continue;
+                }
             };
-        }))
-        .detach();
-    }
+            println!("accepted: {}", addr);
+            smol::spawn(clone_expr!(data_db => async move {
+                match handle_stream(data_db, stream).await {
+                    Ok(_) => {},
+                    Err(e) => println!("handle_stream err: {}", e),
+                };
+            }))
+            .detach();
+        }
+    };
+
+    futures::join!(main_future, gc_future);
+    Ok(())
 }
 
 fn main() {
