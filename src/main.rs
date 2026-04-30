@@ -17,10 +17,6 @@ macro_rules! clone_expr {
     }};
 }
 
-const BIN_TO_HEX_CHAR: [char; 16] = [
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
-];
-
 struct BitIterator {
     expanded_bits: Vec<u8>,
     index: usize,
@@ -65,17 +61,6 @@ impl Iterator for BitIterator {
         self.index += self.bits;
         Some(acc)
     }
-}
-
-fn hex_string(buf: &[u8]) -> String {
-    let mut string = String::new();
-    for v in buf {
-        let first_half = (v & 0xF0) >> 4;
-        let second_half = v & 0x0F;
-        string.push(BIN_TO_HEX_CHAR[first_half as usize]);
-        string.push(BIN_TO_HEX_CHAR[second_half as usize]);
-    }
-    string
 }
 
 const BIN_TO_BASE64_CHAR: [char; 64] = [
