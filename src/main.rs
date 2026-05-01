@@ -1,6 +1,5 @@
 use std::{
     env,
-    net::Shutdown,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -8,7 +7,7 @@ use std::{
 
 use smol::{
     Timer,
-    fs::{File, create_dir, create_dir_all, remove_file},
+    fs::{File, create_dir, remove_file},
     io,
     lock::Mutex,
     net::{TcpListener, TcpStream},
