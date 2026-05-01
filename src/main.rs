@@ -24,6 +24,18 @@ macro_rules! clone_expr {
     }};
 }
 
+macro_rules! println_err {
+    ($expr: expr) => {{
+        let res = $expr;
+        if let Err(e) = &res {
+            println!("{}:{} {}", file!(), line!(), e)
+        }
+        res
+    }};
+}
+
+type DataId = [u8; 4];
+
 struct BitIterator {
     expanded_bits: Vec<u8>,
     index: usize,
@@ -118,17 +130,33 @@ impl DataDb {
         }
     }
 
+    fn get_filename(&self, id: &str) -> PathBuf {
+        Path::new(&self.dir).join(id)
+    }
+
     async fn insert(&self, id: String, reader: impl AsyncRead) -> anyhow::Result<()> {
-        let path = Path::new(&self.dir).join(&id);
+        let reader = reader.take(2u64.pow(20) * 10); // 10mib
+
+        let path = self.get_filename(&id);
 
         println!("creating file: {}", path.to_str().unwrap());
         let file = File::create(path.to_str().unwrap()).await?;
         self.files.lock().await.push(CreatedFile::new(path.clone()));
 
         io::copy(reader, file).await?;
-        println!("copied {} into {}", &id, path.to_str().unwrap());
+        println!("[{}] copied into {}", &id, path.to_str().unwrap());
 
         Ok(())
+    }
+
+    async fn reader_for(&self, id: &str) -> anyhow::Result<Option<impl AsyncRead>> {
+        let path = self.get_filename(id);
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+
+        let file = File::open(path).await?;
+        Ok(Some(file))
     }
 
     async fn gc(&self) -> anyhow::Result<()> {
@@ -140,21 +168,18 @@ impl DataDb {
             while i < files.len() {
                 let file = files[i].clone();
 
-                if !file.expired(Duration::from_hours(6)) {
+                if !file.expired(Duration::from_hours(1)) {
                     i += 1;
                     continue;
                 }
 
                 futures.push(async move {
                     println!("removing: {}", file.path.to_str().unwrap());
-                    remove_file(&file.path).await?;
-                    anyhow::Ok(())
+                    let _ = println_err!(remove_file(&file.path).await);
                 });
                 files.swap_remove(i);
             }
-            for v in futures::future::join_all(futures).await {
-                v?;
-            }
+            futures::future::join_all(futures).await;
         }
         unreachable!();
     }
@@ -166,8 +191,8 @@ async fn fill_rand_bytes(buf: &mut [u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_stream(data_db: DataDb, mut stream: TcpStream) -> anyhow::Result<()> {
-    let mut data_id: [u8; 4] = [0; 4];
+async fn handle_upload(data_db: DataDb, mut stream: TcpStream) -> anyhow::Result<()> {
+    let mut data_id: DataId = [0; 4];
     fill_rand_bytes(&mut data_id).await?;
 
     let id = base64_string(&data_id);
@@ -175,6 +200,24 @@ async fn handle_stream(data_db: DataDb, mut stream: TcpStream) -> anyhow::Result
 
     stream.write_all(id.as_bytes()).await?;
     stream.write(b"\n").await?;
+
+    Ok(())
+}
+
+async fn handle_download(data_db: DataDb, mut stream: TcpStream) -> anyhow::Result<()> {
+    let mut id = String::new();
+    (&mut stream).take(512).read_to_string(&mut id).await?;
+    let id = id.trim_end_matches('\n');
+
+    let Some(file_reader) = data_db.reader_for(id).await? else {
+        stream
+            .write_all(format!("{id} does not exist").as_bytes())
+            .await?;
+        anyhow::bail!("{id} does not exist");
+    };
+
+    println!("reading {id}");
+    io::copy(file_reader, stream).await?;
 
     Ok(())
 }
@@ -187,7 +230,10 @@ async fn async_main() -> anyhow::Result<()> {
         .map(|v| v.parse::<u16>())
         .unwrap_or(Ok(3000))?;
 
-    let listener = TcpListener::bind(format!("{}:{}", address_host, address_port)).await?;
+    let upload_listener = TcpListener::bind(format!("{}:{}", address_host, address_port)).await?;
+    let download_listener =
+        TcpListener::bind(format!("{}:{}", address_host, address_port + 1)).await?;
+    println!("bound: {}, {}", address_port, address_port + 1);
 
     if let Err(e) = create_dir("/tmp/tronbin").await {
         if e.kind() != io::ErrorKind::AlreadyExists {
@@ -198,9 +244,9 @@ async fn async_main() -> anyhow::Result<()> {
 
     let gc_future = data_db.gc();
 
-    let main_future = async {
+    let upload_future = async {
         loop {
-            let (stream, addr) = match listener.accept().await {
+            let (stream, addr) = match upload_listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
                     println!("error accepting: {}", e);
@@ -209,16 +255,30 @@ async fn async_main() -> anyhow::Result<()> {
             };
             println!("accepted: {}", addr);
             smol::spawn(clone_expr!(data_db => async move {
-                match handle_stream(data_db, stream).await {
-                    Ok(_) => {},
-                    Err(e) => println!("handle_stream err: {}", e),
-                };
+                let _ = println_err!(handle_upload(data_db, stream).await);
             }))
             .detach();
         }
     };
 
-    futures::join!(main_future, gc_future);
+    let download_future = async {
+        loop {
+            let (stream, addr) = match download_listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("error accepting: {}", e);
+                    continue;
+                }
+            };
+            println!("accepted: {}", addr);
+            smol::spawn(clone_expr!(data_db => async move {
+                let _ = println_err!(handle_download(data_db, stream).await);
+            }))
+            .detach();
+        }
+    };
+
+    futures::join!(upload_future, gc_future, download_future);
     Ok(())
 }
 
