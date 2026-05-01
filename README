@@ -1,0 +1,10 @@
+termbin.com like alternative.
+
+After compiling and starting, it listens by default on 3000 for uploads and 3001 for downloads.
+
+Uploading:
+$ echo 'hello world' | nc -N localhost 3000
+$ FF0x
+
+Downloading, to stdout
+$ echo 'FF0x' | nc -N localhost 3001
