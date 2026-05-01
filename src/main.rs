@@ -224,7 +224,7 @@ async fn handle_download(data_db: DataDb, mut stream: TcpStream) -> anyhow::Resu
 async fn async_main() -> anyhow::Result<()> {
     let address_host = env::var("LISTEN_HOST")
         .map(|v| String::from(v))
-        .unwrap_or("127.0.0.1".to_string());
+        .unwrap_or("0.0.0.0".to_string());
     let address_port = env::var("LISTEN_PORT")
         .map(|v| v.parse::<u16>())
         .unwrap_or(Ok(3000))?;
