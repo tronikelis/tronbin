@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env,
     path::{Path, PathBuf},
     sync::Arc,
@@ -21,6 +22,18 @@ macro_rules! clone_expr {
         )+
         $expr
     }};
+}
+
+macro_rules! err_side_effect {
+    ($expr:expr, $effect:expr) => {{
+        match $expr {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                $effect
+                Err(e)
+            }
+        }
+    }}
 }
 
 macro_rules! println_err {
@@ -96,17 +109,20 @@ fn base64_string(buf: &[u8]) -> String {
     string
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CreatedFile {
     created_at: Instant,
     path: PathBuf,
+    size: usize,
 }
 
 impl CreatedFile {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, size: usize, file: File) -> Self {
+        drop(file); // this struct has ownership of the file, but it does not need to use it
         Self {
             created_at: Instant::now(),
             path,
+            size,
         }
     }
 
@@ -115,17 +131,82 @@ impl CreatedFile {
     }
 }
 
+impl Drop for CreatedFile {
+    fn drop(&mut self) {
+        let path = self.path.clone();
+        smol::spawn(async move {
+            println!("dropping: {}", path.to_str().unwrap_or("?"));
+            let _ = println_err!(remove_file(path).await);
+        })
+        .detach();
+    }
+}
+
+#[derive(Debug)]
+struct Files {
+    files: VecDeque<CreatedFile>,
+    size: usize,
+    max_size: usize,
+}
+
+impl Files {
+    fn new(max_size: usize) -> Self {
+        Self {
+            files: VecDeque::new(),
+            size: 0,
+            max_size,
+        }
+    }
+
+    fn push_back(&mut self, file: CreatedFile) {
+        self.size += file.size;
+        if self.size > self.max_size {
+            self.create_space_for(self.size - self.max_size);
+        }
+        self.files.push_back(file);
+    }
+
+    fn pop_front(&mut self) -> Option<CreatedFile> {
+        let file = self.files.pop_front()?;
+        self.size -= file.size;
+        Some(file)
+    }
+
+    fn try_expire_many(&mut self, ttl: Duration) {
+        loop {
+            let Some(file) = self.files.get(0) else {
+                break;
+            };
+            if file.expired(ttl) {
+                self.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn create_space_for(&mut self, size: usize) {
+        let mut removed_space = 0;
+        while removed_space < size {
+            let Some(file) = self.pop_front() else {
+                break;
+            };
+            removed_space += file.size;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DataDb {
     dir: String,
-    files: Arc<Mutex<Vec<CreatedFile>>>,
+    files: Arc<Mutex<Files>>,
 }
 
 impl DataDb {
-    fn new(dir: String) -> Self {
+    fn new(dir: String, max_size: usize) -> Self {
         Self {
+            files: Arc::new(Mutex::new(Files::new(max_size))),
             dir,
-            files: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -139,11 +220,22 @@ impl DataDb {
         let path = self.get_filename(&id);
 
         println!("creating file: {}", path.to_str().unwrap());
-        let file = File::create(path.to_str().unwrap()).await?;
-        self.files.lock().await.push(CreatedFile::new(path.clone()));
+        let mut file = File::create(path.to_str().unwrap()).await?;
 
-        io::copy(reader, file).await?;
-        println!("[{}] copied into {}", &id, path.to_str().unwrap());
+        let size = err_side_effect!(io::copy(reader, &mut file).await, {
+            remove_file(path.to_str().unwrap()).await?;
+        })?;
+
+        println!(
+            "[{}] copied {}kib into {}",
+            &id,
+            size / 1024,
+            path.to_str().unwrap()
+        );
+        self.files
+            .lock()
+            .await
+            .push_back(CreatedFile::new(path.clone(), size as usize, file));
 
         Ok(())
     }
@@ -161,24 +253,10 @@ impl DataDb {
     async fn gc(&self) -> anyhow::Result<()> {
         let mut timer = Timer::interval(Duration::from_secs(1));
         while let Some(_) = timer.next().await {
-            let mut files = self.files.lock().await;
-            let mut futures = Vec::new();
-            let mut i = 0;
-            while i < files.len() {
-                let file = files[i].clone();
-
-                if !file.expired(Duration::from_hours(1)) {
-                    i += 1;
-                    continue;
-                }
-
-                futures.push(async move {
-                    println!("removing: {}", file.path.to_str().unwrap());
-                    let _ = println_err!(remove_file(&file.path).await);
-                });
-                files.swap_remove(i);
-            }
-            futures::future::join_all(futures).await;
+            self.files
+                .lock()
+                .await
+                .try_expire_many(Duration::from_hours(1));
         }
         unreachable!();
     }
@@ -222,9 +300,7 @@ async fn handle_download(data_db: DataDb, mut stream: TcpStream) -> anyhow::Resu
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    let address_host = env::var("LISTEN_HOST")
-        .map(|v| String::from(v))
-        .unwrap_or("0.0.0.0".to_string());
+    let address_host = env::var("LISTEN_HOST").unwrap_or("0.0.0.0".to_string());
     let address_port = env::var("LISTEN_PORT")
         .map(|v| v.parse::<u16>())
         .unwrap_or(Ok(3000))?;
@@ -239,7 +315,11 @@ async fn async_main() -> anyhow::Result<()> {
             anyhow::bail!(e);
         }
     }
-    let data_db = DataDb::new("/tmp/tronbin".to_string());
+
+    let max_size = env::var("MAX_SIZE")
+        .map(|v| v.parse::<usize>())
+        .unwrap_or(Ok(2usize.pow(20) * 100))?;
+    let data_db = DataDb::new("/tmp/tronbin".to_string(), max_size);
 
     let gc_future = data_db.gc();
 
