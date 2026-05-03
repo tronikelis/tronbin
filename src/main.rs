@@ -210,14 +210,17 @@ impl DataDb {
         }
     }
 
-    fn get_filename(&self, id: &str) -> PathBuf {
-        Path::new(&self.dir).join(id)
+    fn get_filename(&self, id: &str) -> anyhow::Result<PathBuf> {
+        if id.contains(".") || id.contains("/") {
+            anyhow::bail!("path {} contains dots,slashes", id);
+        }
+        Ok(Path::new(&self.dir).join(id))
     }
 
     async fn insert(&self, id: String, reader: impl AsyncRead) -> anyhow::Result<()> {
         let reader = reader.take(2u64.pow(20) * 10); // 10mib
 
-        let path = self.get_filename(&id);
+        let path = self.get_filename(&id)?;
 
         println!("creating file: {}", path.to_str().unwrap());
         let mut file = File::create(path.to_str().unwrap()).await?;
@@ -241,7 +244,7 @@ impl DataDb {
     }
 
     async fn reader_for(&self, id: &str) -> anyhow::Result<Option<impl AsyncRead>> {
-        let path = self.get_filename(id);
+        let path = self.get_filename(id)?;
         if !path.try_exists()? {
             return Ok(None);
         }
