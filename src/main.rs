@@ -223,10 +223,10 @@ impl DataDb {
         let path = self.get_filename(&id)?;
 
         println!("creating file: {}", path.to_str().unwrap());
-        let mut file = File::create(path.to_str().unwrap()).await?;
+        let mut file = File::create(&path).await?;
 
         let size = err_side_effect!(io::copy(reader, &mut file).await, {
-            remove_file(path.to_str().unwrap()).await?;
+            remove_file(&path).await?;
         })?;
 
         println!(
